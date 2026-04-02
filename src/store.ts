@@ -258,16 +258,39 @@ export class MemoryStore {
     try {
       table = await db.openTable(TABLE_NAME);
 
-      // Check if we need to add scope column for backward compatibility
+      // Migrate legacy tables: add missing columns for backward compatibility
       try {
-        const sample = await table.query().limit(1).toArray();
-        if (sample.length > 0 && !("scope" in sample[0])) {
+        const schema = await table.schema();
+        const fieldNames = new Set(schema.fields.map((f: { name: string }) => f.name));
+
+        const missingColumns: Array<{ name: string; valueSql: string }> = [];
+        if (!fieldNames.has("scope")) {
+          missingColumns.push({ name: "scope", valueSql: "'global'" });
+        }
+        if (!fieldNames.has("timestamp")) {
+          missingColumns.push({ name: "timestamp", valueSql: "CAST(0 AS DOUBLE)" });
+        }
+        if (!fieldNames.has("metadata")) {
+          missingColumns.push({ name: "metadata", valueSql: "'{}'" });
+        }
+
+        if (missingColumns.length > 0) {
           console.warn(
-            "Adding scope column for backward compatibility with existing data",
+            `memory-lancedb-pro: migrating legacy table — adding columns: ${missingColumns.map((c) => c.name).join(", ")}`,
+          );
+          await table.addColumns(missingColumns);
+          console.log(
+            `memory-lancedb-pro: migration complete — ${missingColumns.length} column(s) added`,
           );
         }
       } catch (err) {
-        console.warn("Could not check table schema:", err);
+        const msg = String(err);
+        if (msg.includes("already exists")) {
+          // Concurrent initialization race — another process already added the columns
+          console.log("memory-lancedb-pro: migration columns already exist (concurrent init)");
+        } else {
+          console.warn("memory-lancedb-pro: could not check/migrate table schema:", err);
+        }
       }
     } catch (_openErr) {
       // Table doesn't exist yet — create it
@@ -1084,5 +1107,50 @@ export class MemoryStore {
       this.ftsIndexCreated = false;
       return { success: false, error: msg };
     }
+  }
+
+  /**
+   * Fetch memories older than `maxTimestamp` including their raw vectors.
+   * Used exclusively by the memory compactor; vectors are intentionally
+   * omitted from `list()` for performance, but compaction needs them for
+   * cosine-similarity clustering.
+   */
+  async fetchForCompaction(
+    maxTimestamp: number,
+    scopeFilter?: string[],
+    limit = 200,
+  ): Promise<MemoryEntry[]> {
+    await this.ensureInitialized();
+
+    const conditions: string[] = [`timestamp < ${maxTimestamp}`];
+
+    if (scopeFilter && scopeFilter.length > 0) {
+      const scopeConditions = scopeFilter
+        .map((scope) => `scope = '${escapeSqlLiteral(scope)}'`)
+        .join(" OR ");
+      conditions.push(`((${scopeConditions}) OR scope IS NULL)`);
+    }
+
+    const whereClause = conditions.join(" AND ");
+
+    const results = await this.table!
+      .query()
+      .where(whereClause)
+      .toArray();
+
+    return results
+      .slice(0, limit)
+      .map(
+        (row): MemoryEntry => ({
+          id: row.id as string,
+          text: row.text as string,
+          vector: Array.isArray(row.vector) ? (row.vector as number[]) : [],
+          category: row.category as MemoryEntry["category"],
+          scope: (row.scope as string | undefined) ?? "global",
+          importance: Number(row.importance),
+          timestamp: Number(row.timestamp),
+          metadata: (row.metadata as string) || "{}",
+        }),
+      );
   }
 }
