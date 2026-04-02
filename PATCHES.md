@@ -63,6 +63,7 @@ At the time this file was last updated, the intended live branch/line for this p
 - Why it exists: OpenClaw `2026.4.1+` expects memory plugins to explicitly register a memory runtime. Without this, the plugin may load and register tools but still appear unavailable as the active system memory backend.
 - Upstream PR: `#449`
 - PR title: `fix: register memory runtime for OpenClaw 2026.4.1`
+- Upstream status at last check: `OPEN, approved`
 - Expected future action: remove/reduce this local patch only after verifying the upstream branch has absorbed equivalent behavior
 
 ## Validation already performed for live cutover
