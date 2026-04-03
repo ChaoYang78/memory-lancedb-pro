@@ -56,6 +56,7 @@ At the time this file was last updated, the intended live branch/line for this p
 - Why it exists: upstream currently does not resolve env vars for rerank config values, which breaks configurations stored as environment references
 - Upstream PR: `#414`
 - PR title: `fix: resolve env vars in retrieval rerank config`
+- Upstream status at last check: `MERGED into upstream master`
 - Expected future action: remove/reduce this local patch only after verifying the upstream branch has absorbed equivalent behavior
 
 ### 2. OpenClaw 2026.4.1 memory runtime registration
