@@ -92,6 +92,7 @@ async function withTestEnv(apiKeyConfig, fn) {
       registerTool(t, m) { this.toolFactories[m.name] = typeof t === "function" ? t : () => t; },
       registerCli() {},
       registerService(s) { this.services.push(s); },
+      registerMemoryRuntime() {},
       on(name, handler) { this.hooks[name] = handler; },
       registerHook(name, handler) { this.hooks[name] = handler; },
     };

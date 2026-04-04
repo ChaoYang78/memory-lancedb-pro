@@ -70,6 +70,7 @@ function createApiHarness({ dbPath, embeddingBaseURL }) {
     registerService(service) {
       this.services.push(service);
     },
+    registerMemoryRuntime() {},
     on(name, handler) {
       this.hooks[name] = handler;
     },

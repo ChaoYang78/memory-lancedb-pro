@@ -47,6 +47,9 @@ function createMockApi(pluginConfig, options = {}) {
     registerService(service) {
       options.services?.push(service);
     },
+    registerMemoryRuntime(runtime) {
+      options.memoryRuntime = runtime;
+    },
     on(name, handler) {
       this.hooks[name] = handler;
     },

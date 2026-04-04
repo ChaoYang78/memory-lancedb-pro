@@ -134,6 +134,7 @@ function createMockApi(dbPath, embeddingBaseURL, llmBaseURL, logs) {
     registerService(service) {
       this.services.push(service);
     },
+    registerMemoryRuntime() {},
     on(name, handler) {
       this.hooks[name] = handler;
     },

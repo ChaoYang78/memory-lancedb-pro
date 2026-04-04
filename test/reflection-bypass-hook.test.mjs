@@ -52,6 +52,7 @@ function createPluginApiHarness({ pluginConfig, resolveRoot }) {
     registerTool() {},
     registerCli() {},
     registerService() {},
+    registerMemoryRuntime() {},
     on(eventName, handler, meta) {
       const list = eventHandlers.get(eventName) || [];
       list.push({ handler, meta });
