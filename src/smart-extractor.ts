@@ -48,6 +48,7 @@ import {
   isUserMdExclusiveMemory,
   type WorkspaceBoundaryConfig,
 } from "./workspace-boundary.js";
+import { classifyTemporal, inferExpiry } from "./temporal-classifier.js";
 import { inferAtomicBrandItemPreferenceSlot } from "./preference-slots.js";
 import { batchDedup } from "./batch-dedup.js";
 
@@ -68,10 +69,129 @@ import { batchDedup } from "./batch-dedup.js";
  * - "Sender (untrusted metadata):" + JSON code blocks
  * - "Replied message (untrusted, for context):" + JSON code blocks
  * - Standalone JSON blocks containing message_id/sender_id fields
+ *
+ * Note: stripLeadingRuntimeWrappers and stripRuntimeWrapperBoilerplate from
+ * the old implementation are dead code after this refactor — they are not
+ * called anywhere in the pipeline. They have been removed.
  */
 export function stripEnvelopeMetadata(text: string): string {
+  // Matches wrapper lines: [Subagent Context] or [Subagent Task], possibly with
+  // inline content on the same line (e.g. "[Subagent Task] Reply with brief ack.").
+  // Also matches when the wrapper prefix is on its own line ("]\n" = no content after ]).
+  const WRAPPER_LINE_RE = /^\[(?:Subagent Context|Subagent Task)\](?:\s|$|\n)?/i;
+  const BOILERPLATE_RE = /^(?:Results auto-announce to your requester\.?|do not busy-poll for status\.?|Reply with a brief acknowledgment only\.?|Do not use any memory tools\.?)$/im;
+  // Anchored inline variant: only strip boilerplate when it starts the wrapper
+  // remainder. This avoids erasing legitimate inline payload that merely quotes
+  // a boilerplate phrase later in the sentence.
+  // Repeat the anchored segment so composite wrappers like "You are running...
+  // Results auto-announce..." are fully removed before preserving any payload.
+  // The subagent running phrase uses (?<=\.)\s+|$ alternation (same as old
+  // RUNTIME_WRAPPER_BOILERPLATE_RE) so that parenthetical depth like "(depth 1/1)."
+  // is included before the ending whitespace, correctly stripping the full phrase.
+  const INLINE_BOILERPLATE_RE =
+    /^(?:(?:You are running as a subagent\b.*?(?:(?<=\.)\s+|$)|Results auto-announce to your requester\.?\s*|do not busy-poll for status\.?\s*|Reply with a brief acknowledgment only\.?\s*|Do not use any memory tools\.?\s*))+/i;
+  // Anchor to start of line — prevents quoted/cited false-positives
+  const SUBAGENT_RUNNING_RE = /^You are running as a subagent\b/i;
+
+  const originalLines = text.split("\n");
+
+  // Pre-scan: determine if there are leading wrappers.
+  // Needed to decide whether boilerplate in the leading zone should be stripped
+  // (boilerplate without a wrapper prefix is preserved — it may be legitimate user text).
+  //
+  // FIX (Must Fix 2): Only scan the ACTUAL leading zone — lines before the first
+  // real user content. Previously scanned ALL lines, causing false positives when
+  // a wrapper appeared in the trailing zone (e.g. user-pasted quoted text).
+  let foundLeadingWrapper = false;
+  for (let i = 0; i < originalLines.length; i++) {
+    const trimmed = originalLines[i].trim();
+    if (trimmed === "") continue; // blank lines are part of leading zone
+    if (WRAPPER_LINE_RE.test(trimmed)) { foundLeadingWrapper = true; continue; }
+    if (BOILERPLATE_RE.test(trimmed)) continue;
+    // First real user content — stop scanning, this is the leading zone boundary
+    break;
+  }
+
+  // Single-pass state machine: find leading zone end and build result simultaneously.
+  // Key: "You are running as a subagent..." on its own line AFTER a wrapper prefix
+  // is wrapper CONTENT (must be stripped), not user content.
+  let stillInLeadingZone = true;
+  let prevWasWrapper = false;
+  let encounteredWrapperYet = false; // FIX (MAJOR): per-line flag, not global
+  const result: string[] = [];
+
+  for (let i = 0; i < originalLines.length; i++) {
+    const rawLine = originalLines[i];
+    const trimmed = rawLine.trim();
+    const isWrapper = WRAPPER_LINE_RE.test(trimmed);
+    const isBoilerplate = BOILERPLATE_RE.test(trimmed);
+    const afterPrefix = trimmed.replace(WRAPPER_LINE_RE, "").trim();
+    const isBoilerplateAfterPrefix = BOILERPLATE_RE.test(afterPrefix);
+    const isSubagentContent = prevWasWrapper && SUBAGENT_RUNNING_RE.test(trimmed);
+
+    // Strip wrapper lines only when inside the leading zone (N2 fix)
+    if (stillInLeadingZone && isWrapper) {
+      prevWasWrapper = true;
+      encounteredWrapperYet = true;
+      // 1. Strip wrapper prefix
+      let remainder = afterPrefix;
+      // 2. Remove all boilerplate phrases from remainder (handles inline
+      //    wrapper+boilerplate like "[Subagent Context] ... Results auto-announce...").
+      //    Use INLINE_BOILERPLATE_RE (anchored, includes subagent phrase) so only
+      //    leading wrapper boilerplate is removed while quoted user payload remains.
+      remainder = remainder.replace(INLINE_BOILERPLATE_RE, "").replace(/\s{2,}/g, " ").trim();
+      // 3. Keep remainder if non-empty (non-boilerplate inline content preserved);
+      //    strip the whole line if only boilerplate was present
+      result.push(remainder);
+      continue;
+    }
+
+    if (stillInLeadingZone) {
+      // Blank line — strip but do NOT exit the leading zone (Must Fix 1 fix)
+      if (trimmed === "") {
+        result.push("");
+        continue;
+      }
+
+      // Boilerplate check: use afterPrefix (wrapper-stripped content) so that
+      // inline wrapper+boilerplate like "[Subagent Task] Reply with brief ack."
+      // is correctly identified as boilerplate and removed.
+      const contentForBoilerplateCheck = isWrapper ? afterPrefix : trimmed;
+      const isBoilerplateInline = BOILERPLATE_RE.test(contentForBoilerplateCheck);
+
+      if (isBoilerplateInline) {
+        // Boilerplate in leading zone — strip only when a wrapper has ALREADY
+        // appeared on a PREVIOUS line. This correctly handles the case where
+        // boilerplate text appears BEFORE the first wrapper in the leading zone
+        // (e.g. legitimate user text matching a boilerplate phrase, followed
+        // later by a wrapper).
+        result.push(encounteredWrapperYet ? "" : rawLine);
+        continue;
+      }
+
+      if (isSubagentContent) {
+        // Multiline wrapper: "You are running as a subagent..." on its own line
+        // after a wrapper prefix — strip it; keep prevWasWrapper true
+        result.push(""); // strip
+        continue;
+      }
+
+      // Real user content — exit the leading zone permanently
+      stillInLeadingZone = false;
+      prevWasWrapper = false;
+      encounteredWrapperYet = false;
+      result.push(rawLine); // preserve
+      continue;
+    }
+
+    // After leaving leading zone — always preserve
+    result.push(rawLine);
+  }
+
+  let cleaned = result.join("\n");
+
   // 1. Strip "System: [timestamp] Channel..." lines
-  let cleaned = text.replace(
+  cleaned = cleaned.replace(
     /^System:\s*\[[\d\-: +GMT]+\]\s+\S+\[.*?\].*$/gm,
     "",
   );
@@ -86,7 +206,7 @@ export function stripEnvelopeMetadata(text: string): string {
   // 3. Strip any remaining JSON blocks that look like envelope metadata
   //    (contain message_id and sender_id fields)
   cleaned = cleaned.replace(
-    /```json\s*\{[^}]*"message_id"\s*:[^}]*"sender_id"\s*:[^}]*\}\s*```/g,
+    /```json\s*(?=\{[\s\S]*?"message_id"\s*:)(?=\{[\s\S]*?"sender_id"\s*:)\{[\s\S]*?\}\s*```/g,
     "",
   );
 
@@ -227,10 +347,9 @@ export class SmartExtractor {
     let survivingCandidates = capped;
     try {
       const abstracts = capped.map((c) => c.abstract);
-      const vectors = await Promise.all(
-        abstracts.map((a) => this.embedder.embed(a).catch(() => [] as number[])),
-      );
-      const dedupResult = batchDedup(abstracts, vectors);
+      const vectors = await this.embedder.embedBatch(abstracts);
+      const safeVectors = vectors.map((v) => v || []);
+      const dedupResult = batchDedup(abstracts, safeVectors);
       if (dedupResult.duplicateIndices.length > 0) {
         survivingCandidates = dedupResult.survivingIndices.map((i) => capped[i]);
         stats.skipped += dedupResult.duplicateIndices.length;
@@ -244,14 +363,20 @@ export class SmartExtractor {
       );
     }
 
-    // Step 2: Process each surviving candidate through dedup pipeline
-    for (const candidate of survivingCandidates) {
+    // Step 2: Process each surviving candidate through dedup pipeline.
+    //
+    // Optimization: filter boundary-excluded candidates BEFORE batch embedding
+    // to avoid wasting embed API calls on candidates that will be skipped.
+    // See MR1 from code review.
+    const processableCandidates: { index: number; candidate: CandidateMemory }[] = [];
+    for (let i = 0; i < survivingCandidates.length; i++) {
+      const c = survivingCandidates[i];
       if (
         isUserMdExclusiveMemory(
           {
-            memoryCategory: candidate.category,
-            abstract: candidate.abstract,
-            content: candidate.content,
+            memoryCategory: c.category,
+            abstract: c.abstract,
+            content: c.content,
           },
           this.config.workspaceBoundary,
         )
@@ -259,11 +384,40 @@ export class SmartExtractor {
         stats.skipped += 1;
         stats.boundarySkipped = (stats.boundarySkipped ?? 0) + 1;
         this.log(
-          `memory-pro: smart-extractor: skipped USER.md-exclusive [${candidate.category}] ${candidate.abstract.slice(0, 60)}`,
+          `memory-pro: smart-extractor: skipped USER.md-exclusive [${c.category}] ${c.abstract.slice(0, 60)}`,
         );
         continue;
       }
+      processableCandidates.push({ index: i, candidate: c });
+    }
 
+    // Pre-compute vectors for processable non-profile candidates in a single batch API call
+    // to reduce embedding round-trips from N to 1.
+    const precomputedVectors = new Map<number, number[]>();
+    const nonProfileToEmbed: { index: number; text: string }[] = [];
+    for (const { index, candidate } of processableCandidates) {
+      if (!ALWAYS_MERGE_CATEGORIES.has(candidate.category)) {
+        nonProfileToEmbed.push({ index, text: `${candidate.abstract} ${candidate.content}` });
+      }
+    }
+    if (nonProfileToEmbed.length > 0) {
+      try {
+        const batchTexts = nonProfileToEmbed.map((e) => e.text);
+        const batchVectors = await this.embedder.embedBatch(batchTexts);
+        for (let j = 0; j < nonProfileToEmbed.length; j++) {
+          const vec = batchVectors[j];
+          if (vec && vec.length > 0) {
+            precomputedVectors.set(nonProfileToEmbed[j].index, vec);
+          }
+        }
+      } catch (err) {
+        this.log(
+          `memory-pro: smart-extractor: batch pre-embed failed, will embed individually: ${String(err)}`,
+        );
+      }
+    }
+
+    for (const { index, candidate } of processableCandidates) {
       try {
         await this.processCandidate(
           candidate,
@@ -272,6 +426,7 @@ export class SmartExtractor {
           stats,
           targetScope,
           scopeFilter,
+          precomputedVectors.get(index),
         );
       } catch (err) {
         this.log(
@@ -291,38 +446,70 @@ export class SmartExtractor {
    * Filter out texts that match noise prototypes by embedding similarity.
    * Long texts (>300 chars) are passed through without checking.
    * Only active when noiseBank is configured and initialized.
+   *
+   * Uses batch embedding to reduce API round-trips from N to 1.
    */
   async filterNoiseByEmbedding(texts: string[]): Promise<string[]> {
     const noiseBank = this.config.noiseBank;
     if (!noiseBank || !noiseBank.initialized) return texts;
 
-    const result: string[] = [];
-    for (const text of texts) {
-      // Very short texts lack semantic signal — skip noise check to avoid false positives
-      if (text.length <= 8) {
-        result.push(text);
-        continue;
-      }
-      // Long texts are unlikely to be pure noise queries
-      if (text.length > 300) {
-        result.push(text);
-        continue;
-      }
-      try {
-        const vec = await this.embedder.embed(text);
-        if (!vec || vec.length === 0 || !noiseBank.isNoise(vec)) {
-          result.push(text);
-        } else {
-          this.debugLog(
-            `memory-lancedb-pro: smart-extractor: embedding noise filtered: ${text.slice(0, 80)}`,
-          );
-        }
-      } catch {
-        // Embedding failed — pass text through
-        result.push(text);
+    // Partition: short/long texts bypass noise check; mid-length need embedding
+    const SHORT_THRESHOLD = 8;
+    const LONG_THRESHOLD = 300;
+    const bypassFlags: boolean[] = texts.map(
+      (t) => t.length <= SHORT_THRESHOLD || t.length > LONG_THRESHOLD,
+    );
+
+    const needsEmbedIndices: number[] = [];
+    const needsEmbedTexts: string[] = [];
+    for (let i = 0; i < texts.length; i++) {
+      if (!bypassFlags[i]) {
+        needsEmbedIndices.push(i);
+        needsEmbedTexts.push(texts[i]);
       }
     }
-    return result;
+
+    // Batch embed all mid-length texts in a single API call
+    let vectors: number[][] = [];
+    if (needsEmbedTexts.length > 0) {
+      try {
+        vectors = await this.embedder.embedBatch(needsEmbedTexts);
+      } catch {
+        // Batch failed — pass all through
+        return texts.slice();
+      }
+    }
+
+    const result: string[] = new Array(texts.length);
+    // First, fill in bypass texts (always kept)
+    for (let i = 0; i < texts.length; i++) {
+      if (bypassFlags[i]) {
+        result[i] = texts[i];
+      }
+    }
+
+    // Then, check noise for embedded texts
+    for (let j = 0; j < needsEmbedIndices.length; j++) {
+      const idx = needsEmbedIndices[j];
+      const vec = vectors[j];
+      if (!vec || vec.length === 0) {
+        result[idx] = texts[idx];
+        continue;
+      }
+      if (noiseBank.isNoise(vec)) {
+        this.debugLog(
+          `memory-lancedb-pro: smart-extractor: embedding noise filtered: ${texts[idx].slice(0, 80)}`,
+        );
+        // Leave result[idx] as undefined — will be compacted below
+      } else {
+        result[idx] = texts[idx];
+      }
+    }
+
+    // Compact: remove undefined slots (filtered-out entries).
+    // Use explicit undefined check rather than filter(Boolean) to preserve
+    // empty strings that were legitimately in bypass slots.
+    return result.filter((x): x is string => x !== undefined);
   }
 
   /**
@@ -401,6 +588,13 @@ export class SmartExtractor {
     let shortAbstractCount = 0;
     let noiseAbstractCount = 0;
     for (const raw of result.memories) {
+      if (!raw || typeof raw !== "object") {
+        invalidCategoryCount++;
+        this.debugLog(
+          `memory-lancedb-pro: smart-extractor: dropping null/invalid candidate entry`,
+        );
+        continue;
+      }
       const category = normalizeCategory(raw.category ?? "");
       if (!category) {
         invalidCategoryCount++;
@@ -446,6 +640,10 @@ export class SmartExtractor {
 
   /**
    * Process a single candidate memory: dedup → merge/create → store
+   *
+   * @param precomputedVector - Optional pre-embedded vector for the candidate.
+   *   When provided (from batch pre-embedding), skips the per-candidate embed
+   *   call to reduce API round-trips.
    */
   private async processCandidate(
     candidate: CandidateMemory,
@@ -454,6 +652,7 @@ export class SmartExtractor {
     stats: ExtractionStats,
     targetScope: string,
     scopeFilter?: string[],
+    precomputedVector?: number[],
   ): Promise<void> {
     // Profile always merges (skip dedup — admission control still applies)
     if (ALWAYS_MERGE_CATEGORIES.has(candidate.category)) {
@@ -474,9 +673,9 @@ export class SmartExtractor {
       return;
     }
 
-    // Embed the candidate for vector dedup
-    const embeddingText = `${candidate.abstract} ${candidate.content}`;
-    const vector = await this.embedder.embed(embeddingText);
+    // Use pre-computed vector if available (batch embed optimization),
+    // otherwise fall back to per-candidate embed call.
+    const vector = precomputedVector ?? await this.embedder.embed(`${candidate.abstract} ${candidate.content}`);
     if (!vector || vector.length === 0) {
       this.log("memory-pro: smart-extractor: embedding failed, storing as-is");
       await this.storeCandidate(candidate, vector || [], sessionKey, targetScope);
@@ -956,6 +1155,7 @@ export class SmartExtractor {
     const factKey =
       existingMeta.fact_key ?? deriveFactKey(candidate.category, candidate.abstract);
     const storeCategory = this.mapToStoreCategory(candidate.category);
+    const supersedeClassifyText = candidate.content || candidate.abstract;
     const created = await this.store.store({
       text: candidate.abstract,
       vector,
@@ -990,6 +1190,8 @@ export class SmartExtractor {
               type: "supersedes",
               targetId: matchId,
             }),
+            memory_temporal_type: classifyTemporal(supersedeClassifyText),
+            valid_until: inferExpiry(supersedeClassifyText),
           },
         ),
       ),
@@ -1180,6 +1382,7 @@ export class SmartExtractor {
     // Map 6-category to existing store categories for backward compatibility
     const storeCategory = this.mapToStoreCategory(candidate.category);
 
+    const classifyText = candidate.content || candidate.abstract;
     const metadata = stringifySmartMetadata(
       buildSmartMetadata(
         {
@@ -1201,6 +1404,8 @@ export class SmartExtractor {
           injected_count: 0,
           bad_recall_count: 0,
           suppressed_until_turn: 0,
+          memory_temporal_type: classifyTemporal(classifyText),
+          valid_until: inferExpiry(classifyText),
         },
       ),
     );
